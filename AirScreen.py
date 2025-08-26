@@ -3,6 +3,8 @@ import mediapipe as mp
 import numpy as np
 import os
 import math
+import json
+import time
 from collections import deque
 from sklearn.linear_model import LinearRegression
 from sklearn.cluster import DBSCAN
@@ -22,7 +24,26 @@ imgCanvas = np.zeros((height, width, 3), np.uint8)
 # Store drawing strokes for shape analysis
 current_stroke = []
 all_strokes = []
+undo_stack = []  # NEW: For undo functionality
 stroke_timeout = 30  # frames without drawing before considering stroke complete
+
+# NEW: Additional colors and features
+colors = [
+    (0, 0, 255),    # Red
+    (255, 0, 0),    # Blue
+    (0, 255, 0),    # Green
+    (0, 0, 0),      # Black (eraser)
+    (255, 255, 0),  # Cyan
+    (255, 0, 255),  # Magenta
+    (0, 255, 255),  # Yellow
+    (128, 0, 128),  # Purple
+]
+
+# NEW: Gesture detection variables
+gesture_start_time = 0
+gesture_threshold = 1.0  # seconds to hold gesture
+show_gesture_feedback = False
+gesture_feedback_text = ""
 
 folderPath = 'Header'
 myList = os.listdir(folderPath)
@@ -38,6 +59,17 @@ tipIds = [4, 8, 12, 16, 20]
 xp, yp = [0, 0] 
 frame_count = 0
 last_draw_frame = 0
+color_index = 0  # NEW: Track current color
+
+# NEW: Statistics tracking
+stats = {
+    'total_strokes': 0,
+    'lines': 0,
+    'circles': 0,
+    'rectangles': 0,
+    'freeform': 0,
+    'session_start': time.time()
+}
 
 def detect_line(points, tolerance=0.95):
     """Detect if points form a straight line using linear regression"""
@@ -171,7 +203,7 @@ def smooth_stroke(points, smoothing_factor=0.3):
 def process_completed_stroke(stroke, canvas, color, thick):
     """Process a completed stroke and apply corrections"""
     if len(stroke) < 5:
-        return
+        return 'freeform'
     
     # Try to detect shapes in order of specificity
     is_line, start_pt, end_pt = detect_line(stroke)
@@ -182,11 +214,13 @@ def process_completed_stroke(stroke, canvas, color, thick):
         # Draw straight line
         cv2.line(canvas, tuple(start_pt), tuple(end_pt), color, thick)
         print("Corrected line detected!")
+        return 'line'
         
     elif is_circle and center is not None and radius is not None:
         # Draw perfect circle
         cv2.circle(canvas, center, radius, color, thick)
         print("Corrected circle detected!")
+        return 'circle'
         
     elif is_rect and corners is not None:
         # Draw rectangle
@@ -194,12 +228,168 @@ def process_completed_stroke(stroke, canvas, color, thick):
         pts = pts.reshape((-1, 1, 2))
         cv2.polylines(canvas, [pts], True, color, thick)
         print("Corrected rectangle detected!")
+        return 'rectangle'
         
     else:
         # Apply smoothing to freeform drawing
         smoothed_stroke = smooth_stroke(stroke)
         for i in range(len(smoothed_stroke) - 1):
             cv2.line(canvas, tuple(smoothed_stroke[i]), tuple(smoothed_stroke[i + 1]), color, thick)
+        return 'freeform'
+
+# NEW: Save and load functions
+def save_drawing(strokes, filename="drawing.json"):
+    """Save the current drawing to a file"""
+    try:
+        data = {
+            'strokes': strokes,
+            'stats': stats,
+            'timestamp': time.time()
+        }
+        with open(filename, 'w') as f:
+            json.dump(data, f, indent=2)
+        print(f"Drawing saved to {filename}")
+        return True
+    except Exception as e:
+        print(f"Error saving drawing: {e}")
+        return False
+
+def load_drawing(filename="drawing.json"):
+    """Load a drawing from a file"""
+    try:
+        with open(filename, 'r') as f:
+            data = json.load(f)
+        return data.get('strokes', [])
+    except Exception as e:
+        print(f"Error loading drawing: {e}")
+        return []
+
+# NEW: Undo functionality
+def undo_last_stroke():
+    """Remove the last drawn stroke"""
+    global all_strokes, undo_stack, imgCanvas
+    if all_strokes:
+        # Move last stroke to undo stack
+        undo_stack.append(all_strokes.pop())
+        
+        # Redraw canvas without the last stroke
+        imgCanvas = np.zeros((height, width, 3), np.uint8)
+        for stroke_data in all_strokes:
+            process_completed_stroke(stroke_data['points'], imgCanvas, 
+                                   stroke_data['color'], stroke_data['thickness'])
+        print("Stroke undone!")
+
+# NEW: Redo functionality
+def redo_last_stroke():
+    """Restore the last undone stroke"""
+    global all_strokes, undo_stack, imgCanvas
+    if undo_stack:
+        # Move stroke back from undo stack
+        stroke_data = undo_stack.pop()
+        all_strokes.append(stroke_data)
+        
+        # Redraw the stroke
+        process_completed_stroke(stroke_data['points'], imgCanvas, 
+                               stroke_data['color'], stroke_data['thickness'])
+        print("Stroke redone!")
+
+# NEW: Display statistics and controls
+def draw_ui_elements(image):
+    """Draw UI elements like statistics and controls"""
+    global stats, show_gesture_feedback, gesture_feedback_text
+    
+    # Display current color indicator
+    cv2.circle(image, (50, 150), 20, drawColor, -1)
+    cv2.circle(image, (50, 150), 20, (255, 255, 255), 2)
+    
+    # Display thickness indicator
+    cv2.circle(image, (50, 200), thickness, drawColor, 2)
+    
+    # Display statistics
+    session_time = int(time.time() - stats['session_start'])
+    stats_text = [
+        f"Session: {session_time//60}m {session_time%60}s",
+        f"Total: {stats['total_strokes']}",
+        f"Lines: {stats['lines']}",
+        f"Circles: {stats['circles']}",
+        f"Rectangles: {stats['rectangles']}",
+        f"Freeform: {stats['freeform']}"
+    ]
+    
+    for i, text in enumerate(stats_text):
+        cv2.putText(image, text, (width - 200, 150 + i * 25), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 255, 255), 1)
+    
+    # Display gesture feedback
+    if show_gesture_feedback:
+        cv2.putText(image, gesture_feedback_text, (width//2 - 100, height//2), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 1, (0, 255, 255), 2)
+    
+    # Display controls
+    controls_text = [
+        "Controls:",
+        "Peace Sign: Select/Navigate",
+        "Index Finger: Draw",
+        "Index + Pinky: Erase",
+        "Fist: Clear All",
+        "Thumbs Up (hold): Undo",
+        "OK Sign (hold): Redo",
+        "Three Fingers (hold): Save"
+    ]
+    
+    for i, text in enumerate(controls_text):
+        color = (0, 255, 255) if i == 0 else (255, 255, 255)
+        cv2.putText(image, text, (10, height - 200 + i * 20), 
+                   cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+
+# NEW: Gesture detection for special commands
+def detect_special_gestures(fingers, current_time):
+    """Detect special gestures for commands"""
+    global gesture_start_time, show_gesture_feedback, gesture_feedback_text
+    
+    # Thumbs up gesture for undo
+    if fingers == [1, 0, 0, 0, 0]:
+        if gesture_start_time == 0:
+            gesture_start_time = current_time
+            show_gesture_feedback = True
+            gesture_feedback_text = "Hold for Undo..."
+        elif current_time - gesture_start_time > gesture_threshold:
+            undo_last_stroke()
+            gesture_start_time = 0
+            show_gesture_feedback = False
+            return True
+    
+    # OK sign (thumb + index) for redo
+    elif fingers == [1, 1, 0, 0, 0]:
+        if gesture_start_time == 0:
+            gesture_start_time = current_time
+            show_gesture_feedback = True
+            gesture_feedback_text = "Hold for Redo..."
+        elif current_time - gesture_start_time > gesture_threshold:
+            redo_last_stroke()
+            gesture_start_time = 0
+            show_gesture_feedback = False
+            return True
+    
+    # Three fingers for save
+    elif fingers == [0, 1, 1, 1, 0]:
+        if gesture_start_time == 0:
+            gesture_start_time = current_time
+            show_gesture_feedback = True
+            gesture_feedback_text = "Hold to Save..."
+        elif current_time - gesture_start_time > gesture_threshold:
+            save_drawing(all_strokes, f"drawing_{int(time.time())}.json")
+            gesture_start_time = 0
+            show_gesture_feedback = False
+            return True
+    
+    else:
+        # Reset gesture timing if not holding a gesture
+        if gesture_start_time != 0:
+            gesture_start_time = 0
+            show_gesture_feedback = False
+    
+    return False
 
 with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, max_num_hands=1) as hands:
     while cap.isOpened():
@@ -209,6 +399,7 @@ with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, 
             break
 
         frame_count += 1
+        current_time = time.time()
         image = cv2.cvtColor(cv2.flip(image, 1), cv2.COLOR_BGR2RGB)
         
         image.flags.writeable = False
@@ -242,24 +433,34 @@ with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, 
                         else:
                             fingers.append(0)
 
+                    # NEW: Check for special gestures first
+                    if detect_special_gestures(fingers, current_time):
+                        continue
+
                     # Selection mode
                     nonSel = [0, 3, 4] 
                     if (fingers[1] and fingers[2]) and all(fingers[i] == 0 for i in nonSel):
                         xp, yp = [x1, y1]
 
                         if(y1 < 125):
-                            if(170 < x1 < 295):
-                                header = overlayList[0]
-                                drawColor = (0, 0, 255)
-                            elif(436 < x1 < 561):
-                                header = overlayList[1]
-                                drawColor = (255, 0, 0)
-                            elif(700 < x1 < 825):
-                                header = overlayList[2]
-                                drawColor = (0, 255, 0)
-                            elif(980 < x1 < 1105):
-                                header = overlayList[3]
-                                drawColor = (0, 0, 0)
+                            # NEW: Extended color selection
+                            color_sections = [
+                                (170, 295, 0),   # Red
+                                (295, 420, 1),   # Blue  
+                                (420, 545, 2),   # Green
+                                (545, 670, 3),   # Black
+                                (670, 795, 4),   # Cyan
+                                (795, 920, 5),   # Magenta
+                                (920, 1045, 6),  # Yellow
+                                (1045, 1170, 7), # Purple
+                            ]
+                            
+                            for start_x, end_x, color_idx in color_sections:
+                                if start_x < x1 < end_x and color_idx < len(colors):
+                                    header = overlayList[min(color_idx, len(overlayList)-1)]
+                                    drawColor = colors[color_idx]
+                                    color_index = color_idx
+                                    break
 
                         cv2.rectangle(image, (x1-10, y1-15), (x2+10, y2+23), drawColor, cv2.FILLED)
 
@@ -292,6 +493,12 @@ with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, 
                         imgCanvas = np.zeros((height, width, 3), np.uint8)
                         current_stroke = []
                         all_strokes = []
+                        undo_stack = []  # NEW: Clear undo stack
+                        # NEW: Reset stats
+                        stats.update({
+                            'total_strokes': 0, 'lines': 0, 'circles': 0, 
+                            'rectangles': 0, 'freeform': 0
+                        })
                         xp, yp = [x1, y1]
 
                     # Thickness adjustment
@@ -305,14 +512,15 @@ with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, 
                         v1, v2 = [-v2, v1]
 
                         mod_v = math.sqrt(v1**2 + v2**2)
-                        v1, v2 = [v1/mod_v, v2/mod_v]
+                        if mod_v > 0:  # NEW: Avoid division by zero
+                            v1, v2 = [v1/mod_v, v2/mod_v]
                         
                         c = 3 + r
                         x0, y0 = [int(x0 - v1*c), int(y0 - v2*c)]
                         cv2.circle(image, (x0, y0), int(r/2), drawColor, -1)
 
                         if fingers[4]:                        
-                            thickness = r
+                            thickness = max(5, min(50, r))  # NEW: Limit thickness range
                             cv2.putText(image, 'Check', (x4-25, y4-8), cv2.FONT_HERSHEY_TRIPLEX, 0.8, (0,0,0), 1)
 
                         xp, yp = [x1, y1]
@@ -324,7 +532,8 @@ with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, 
             
             # Redraw all previous corrected strokes
             for stroke_data in all_strokes:
-                process_completed_stroke(stroke_data['points'], imgCanvas, stroke_data['color'], stroke_data['thickness'])
+                shape_type = process_completed_stroke(stroke_data['points'], imgCanvas, 
+                                                    stroke_data['color'], stroke_data['thickness'])
             
             # Process and add the current stroke
             stroke_data = {
@@ -333,12 +542,22 @@ with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, 
                 'thickness': thickness
             }
             all_strokes.append(stroke_data)
-            process_completed_stroke(current_stroke, imgCanvas, drawColor, thickness)
+            shape_type = process_completed_stroke(current_stroke, imgCanvas, drawColor, thickness)
+            
+            # NEW: Update statistics
+            stats['total_strokes'] += 1
+            stats[shape_type] += 1
+            
+            # Clear undo stack when new stroke is added
+            undo_stack = []
             
             current_stroke = []
 
         # Overlay header
         image[0:125, 0:width] = header
+        
+        # NEW: Draw UI elements
+        draw_ui_elements(image)
 
         # Combine canvas with camera feed
         imgGray = cv2.cvtColor(imgCanvas, cv2.COLOR_BGR2GRAY)
@@ -347,9 +566,37 @@ with mp_hands.Hands(min_detection_confidence=0.85, min_tracking_confidence=0.5, 
         img = cv2.bitwise_and(image, imgInv)
         img = cv2.bitwise_or(img, imgCanvas)
 
-        cv2.imshow('MediaPipe Hands', img)
-        if cv2.waitKey(3) & 0xFF == ord('q'):
+        cv2.imshow('Enhanced MediaPipe Drawing', img)  # NEW: Updated window title
+        
+        # NEW: Keyboard shortcuts
+        key = cv2.waitKey(3) & 0xFF
+        if key == ord('q'):
             break
+        elif key == ord('s'):  # Save drawing
+            save_drawing(all_strokes, f"drawing_{int(time.time())}.json")
+        elif key == ord('u'):  # Undo
+            undo_last_stroke()
+        elif key == ord('r'):  # Redo
+            redo_last_stroke()
+        elif key == ord('c'):  # Clear
+            imgCanvas = np.zeros((height, width, 3), np.uint8)
+            current_stroke = []
+            all_strokes = []
+            undo_stack = []
+            stats.update({
+                'total_strokes': 0, 'lines': 0, 'circles': 0, 
+                'rectangles': 0, 'freeform': 0
+            })
 
 cap.release()
 cv2.destroyAllWindows()
+
+# NEW: Print final session statistics
+print("\n=== SESSION SUMMARY ===")
+print(f"Total drawing time: {int(time.time() - stats['session_start'])} seconds")
+print(f"Total strokes: {stats['total_strokes']}")
+print(f"Lines: {stats['lines']}")
+print(f"Circles: {stats['circles']}")
+print(f"Rectangles: {stats['rectangles']}")
+print(f"Freeform drawings: {stats['freeform']}")
+print("Thank you for using Enhanced Hand Drawing!")
